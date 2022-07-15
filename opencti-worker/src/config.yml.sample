@@ -6,3 +6,5 @@ opencti:
 
 worker:
   log_level: 'info'
+  log_format: ''
+  log_datetime_format: ''

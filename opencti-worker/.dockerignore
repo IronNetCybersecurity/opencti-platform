@@ -1,4 +1,2 @@
 .flake8
 .isort.cfg
-mypy.ini
-pylintrc
