@@ -1,1 +1,3 @@
-pycti==5.3.7
+# pycti==5.3.7
+git+https://github.com/IronNetCybersecurity/pycti.git@vhost
+

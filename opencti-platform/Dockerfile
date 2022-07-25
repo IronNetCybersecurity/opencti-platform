@@ -1,5 +1,7 @@
 FROM node:16-alpine AS base
 
+ENV NODE_TLS_REJECT_UNAUTHORIZED="0"
+
 RUN corepack enable
 
 FROM base AS graphql-deps-builder
@@ -8,6 +10,7 @@ WORKDIR /opt/opencti-build/opencti-graphql
 COPY opencti-graphql/package.json opencti-graphql/yarn.lock opencti-graphql/.yarnrc.yml ./
 COPY opencti-graphql/.yarn ./.yarn
 COPY opencti-graphql/patch ./patch
+RUN yarn config set enableStrictSsl false
 RUN yarn install --frozen-lockfile && yarn cache clean --all
 
 
@@ -17,6 +20,7 @@ WORKDIR /opt/opencti-build/opencti-graphql
 COPY opencti-graphql/package.json opencti-graphql/yarn.lock opencti-graphql/.yarnrc.yml ./
 COPY opencti-graphql/.yarn ./.yarn
 COPY opencti-graphql/patch ./patch
+RUN yarn config set enableStrictSsl false
 RUN yarn install
 COPY opencti-graphql /opt/opencti-build/opencti-graphql
 RUN yarn build:prod
@@ -30,6 +34,7 @@ COPY opencti-front/package.json opencti-front/yarn.lock opencti-front/.yarnrc.ym
 COPY opencti-front/.yarn ./.yarn
 COPY opencti-front/patch ./patch
 
+RUN yarn config set enableStrictSsl false
 RUN yarn install
 
 COPY opencti-front /opt/opencti-build/opencti-front
