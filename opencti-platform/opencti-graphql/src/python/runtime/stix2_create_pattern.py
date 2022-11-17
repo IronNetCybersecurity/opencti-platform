@@ -1,12 +1,12 @@
 import sys
 
-from utils.runtime_utils import return_data
 from stix2 import (
     EqualityComparisonExpression,
     ObjectPath,
     ObservationExpression,
     OrBooleanExpression,
 )
+from utils.runtime_utils import return_data
 
 PATTERN_MAPPING = {
     "Autonomous-System": ["number"],
@@ -83,7 +83,9 @@ def stix2_create_pattern(observable_type, observable_value):
 
 if __name__ == "__main__":
     if len(sys.argv) <= 2:
-        return_data({'status': 'error', 'message': 'Missing argument to the Python script'})
+        return_data(
+            {"status": "error", "message": "Missing argument to the Python script"}
+        )
 
     data = stix2_create_pattern(sys.argv[1], sys.argv[2])
     return_data(data)
