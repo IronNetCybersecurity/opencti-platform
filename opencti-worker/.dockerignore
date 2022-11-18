@@ -2,3 +2,4 @@
 .isort.cfg
 mypy.ini
 pylintrc
+src/config.yml.sample

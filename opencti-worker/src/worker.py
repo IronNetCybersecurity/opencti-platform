@@ -1,5 +1,4 @@
-# coding: utf-8
-
+"""OpenCTI Worker"""
 
 import base64
 import ctypes
@@ -12,17 +11,19 @@ import random
 import sys
 import threading
 import time
+from threading import Thread
+from typing import Any, Dict, Union
+
 import pika
 import yaml
-from dataclasses import dataclass, field
-from threading import Thread
-from typing import Any, Dict, List, Optional, Union
 from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from pika import BasicProperties
+from pika.adapters.blocking_connection import BlockingChannel, BlockingConnection
+from pika.spec import Basic
 from prometheus_client import start_http_server
-from pika.adapters.blocking_connection import BlockingChannel
 from pycti import OpenCTIApiClient
 from pycti.connector.opencti_connector_helper import (
     create_ssl_context,
@@ -30,8 +31,9 @@ from pycti.connector.opencti_connector_helper import (
 )
 from requests.exceptions import RequestException, Timeout
 
-PROCESSING_COUNT: int = 4
-MAX_PROCESSING_COUNT: int = 60
+log = logging.getLogger(__name__)
+
+PROCESSING_COUNT = 4
 
 # Telemetry variables definition
 meter = metrics.get_meter(__name__)
@@ -74,341 +76,378 @@ bundles_processing_time_gauge = meter.create_histogram(
 )
 
 
-@dataclass(unsafe_hash=True)
-class Consumer(Thread):  # pylint: disable=too-many-instance-attributes
-    connector: Dict[str, Any] = field(hash=False)
-    opencti_url: str
-    opencti_token: str
-    log_level: str
-    ssl_verify: Union[bool, str] = False
-    json_logging: bool = False
+class Consumer(Thread):
+    """RabbitMQ message consumer"""
 
-    def __post_init__(self) -> None:
+    # pylint: disable=too-many-arguments
+    def __init__(
+        self,
+        connector: Dict[str, Any],
+        opencti_url: str,
+        opencti_token: str,
+        log_level: str,
+        ssl_verify: Union[bool, str] = False,
+        json_logging: bool = False,
+    ) -> None:
         super().__init__()
-        self.api = OpenCTIApiClient(
-            url=self.opencti_url,
-            token=self.opencti_token,
-            log_level=self.log_level,
-            ssl_verify=self.ssl_verify,
-            json_logging=self.json_logging,
+
+        self._api = OpenCTIApiClient(
+            url=opencti_url,
+            token=opencti_token,
+            log_level=log_level,
+            ssl_verify=ssl_verify,
+            json_logging=json_logging,
         )
-        self.queue_name = self.connector["config"]["push"]
-        self.pika_credentials = pika.PlainCredentials(
-            self.connector["config"]["connection"]["user"],
-            self.connector["config"]["connection"]["pass"],
-        )
-        self.pika_parameters = pika.ConnectionParameters(
-            self.connector["config"]["connection"]["host"],
-            self.connector["config"]["connection"]["port"],
-            self.connector["config"]["connection"]["vhost"],
-            self.pika_credentials,
-            ssl_options=pika.SSLOptions(create_ssl_context())
-            if self.connector["config"]["connection"]["use_ssl"]
-            else None,
+        self._queue_name = connector["config"]["push"]
+
+        pika_parameters = pika.ConnectionParameters(
+            host=connector["config"]["connection"]["host"],
+            port=connector["config"]["connection"]["port"],
+            virtual_host=connector["config"]["connection"]["vhost"],
+            credentials=pika.PlainCredentials(
+                connector["config"]["connection"]["user"],
+                connector["config"]["connection"]["pass"],
+            ),
+            ssl_options=(
+                pika.SSLOptions(create_ssl_context())
+                if connector["config"]["connection"]["use_ssl"]
+                else None
+            ),
         )
 
-        self.pika_connection = pika.BlockingConnection(self.pika_parameters)
-        self.channel = self.pika_connection.channel()
-        self.channel.basic_qos(prefetch_count=1)
-        self.processing_count: int = 0
-        self.current_bundle_id: [str, None] = None
-        self.current_bundle_seq: int = 0
+        self._pika_connection = BlockingConnection(pika_parameters)
+        self._channel = self._pika_connection.channel()
+        self._channel.basic_qos(prefetch_count=1)
+        self._processing_count = 0
 
     @property
-    def id(self) -> Any:  # pylint: disable=inconsistent-return-statements
+    def id(self) -> Any:
+        """Get the threat ID"""
+
         if hasattr(self, "_thread_id"):
-            return self._thread_id  # type: ignore  # pylint: disable=no-member
+            return getattr(self, "_thread_id")
+
         # pylint: disable=protected-access
-        for id_, thread in threading._active.items():  # type: ignore
+        # noinspection PyProtectedMember,PyUnresolvedReferences
+        for tid, thread in threading._active.items():
             if thread is self:
-                return id_
+                return tid
+
+        return None
 
     def terminate(self) -> None:
+        """Terminate the thread."""
+
         thread_id = self.id
         res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
             thread_id, ctypes.py_object(SystemExit)
         )
         if res > 1:
             ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
-            logging.info("Unable to kill the thread")
+            log.info("Unable to kill the thread")
 
-    def nack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+    def _nack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+        """NACK a message"""
+
         if channel.is_open:
-            logging.info("%s", f"Message (delivery_tag={delivery_tag}) rejected")
+            log.info(
+                "Message (delivery_tag=%d) rejected",
+                delivery_tag,
+            )
             channel.basic_nack(delivery_tag)
         else:
-            logging.info(
-                "%s",
-                f"Message (delivery_tag={delivery_tag}) NOT rejected (channel closed)",
+            log.info(
+                "Message (delivery_tag=%d) NOT rejected (channel closed)",
+                delivery_tag,
             )
 
-    def ack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+    def _ack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+        """ACK a message"""
+
         if channel.is_open:
-            logging.info("%s", f"Message (delivery_tag={delivery_tag}) acknowledged")
+            log.info(
+                "Message (delivery_tag=%d) acknowledged",
+                delivery_tag,
+            )
             channel.basic_ack(delivery_tag)
         else:
-            logging.info(
-                "%s",
-                (
-                    f"Message (delivery_tag={delivery_tag}) "
-                    "NOT acknowledged (channel closed)"
-                ),
+            log.info(
+                "Message (delivery_tag=%d) NOT acknowledged (channel closed)",
+                delivery_tag,
             )
 
     def stop_consume(self, channel: BlockingChannel) -> None:
+        """Stop consuming if the underlying channel is open"""
+
         if channel.is_open:
             channel.stop_consuming()
 
-    # Callable for consuming a message
     def _process_message(
         self,
         channel: BlockingChannel,
-        method: Any,
-        properties: None,  # pylint: disable=unused-argument
-        body: str,
+        method: Basic.Deliver,
+        _properties: BasicProperties,  # Unused but required
+        body: bytes,
     ) -> None:
+        """Callable for consuming a message"""
+
         data = json.loads(body)
-        logging.info(
-            "%s",
-            (
-                f"Processing a new message (delivery_tag={method.delivery_tag})"
-                ", launching a thread..."
-            ),
+        log.info(
+            "Processing a new message (delivery_tag=%d), launching a thread...",
+            method.delivery_tag,
         )
         thread = Thread(
-            target=self.data_handler,
-            args=[self.pika_connection, channel, method.delivery_tag, data],
+            target=self._data_handler,
+            args=[self._pika_connection, channel, method.delivery_tag, data],
         )
         thread.start()
 
-        while thread.is_alive():  # Loop while the thread is processing
-            self.pika_connection.sleep(0.05)
-        logging.info("Message processed, thread terminated")
+        # Loop while the thread is processing
+        while thread.is_alive():
+            self._pika_connection.sleep(0.05)
 
-    # Data handling
-    def data_handler(  # pylint: disable=too-many-statements, too-many-locals
+        log.info("Message processed, thread terminated")
+
+    # pylint: disable=too-many-arguments,too-many-locals,too-many-statements,too-many-branches
+    def _data_handler(
         self,
-        connection: Any,
+        connection: BlockingConnection,
         channel: BlockingChannel,
-        delivery_tag: str,
+        delivery_tag: int,
         data: Dict[str, Any],
-    ) -> Optional[bool]:
+    ) -> None:
+        """Handle the data from a message"""
+
         start_processing = datetime.datetime.now()
+
         # Set the API headers
         applicant_id = data["applicant_id"]
-        self.api.set_applicant_id_header(applicant_id)
-        work_id = data["work_id"] if "work_id" in data else None
+        self._api.set_applicant_id_header(applicant_id)
+        work_id = data.get("work_id", None)
+
         # Execute the import
-        self.processing_count += 1
         content = "Unparseable"
+        self._processing_count += 1
+        has_retries = self._processing_count < PROCESSING_COUNT
+        processing_count = self._processing_count if has_retries else None
+
         try:
-            event_type = data["type"] if "type" in data else "bundle"
-            types = (
-                data["entities_types"]
-                if "entities_types" in data and len(data["entities_types"]) > 0
-                else None
-            )
-            processing_count = self.processing_count
-            if self.processing_count == PROCESSING_COUNT:
-                processing_count = None  # type: ignore
+            types = data.get("entities_types") or None
+            event_type = data.get("type", "bundle")
+
             if event_type == "bundle":
                 content = base64.b64decode(data["content"]).decode("utf-8")
-                update = data["update"] if "update" in data else False
-                self.api.stix2.import_bundle_from_json(
-                    content, update, types, processing_count
+                update = data.get("update", False)
+                self._api.stix2.import_bundle_from_json(
+                    json_data=content,
+                    update=update,
+                    types=types,
+                    retry_number=processing_count,
                 )
+
                 # Ack the message
-                cb = functools.partial(self.ack_message, channel, delivery_tag)
+                cb = functools.partial(self._ack_message, channel, delivery_tag)
                 connection.add_callback_threadsafe(cb)
+
+                work_id = data.get("work_id")
                 if work_id is not None:
-                    self.api.work.report_expectation(work_id, None)
-                self.processing_count = 0
+                    self._api.work.report_expectation(work_id, None)
+
                 bundles_success_counter.add(1)
-                return True
+                self._processing_count = 0
+
             elif event_type == "event":
-                event = base64.b64decode(data["content"]).decode("utf-8")
-                event_content = json.loads(event)
+                content = base64.b64decode(data["content"]).decode("utf-8")
+                event_content = json.loads(content)
                 event_type = event_content["type"]
-                if event_type == "create" or event_type == "update":
+
+                if event_type in ("create", "update"):
                     bundle = {
                         "type": "bundle",
                         "objects": [event_content["data"]],
                     }
-                    self.api.stix2.import_bundle(bundle, True, types, processing_count)
+                    self._api.stix2.import_bundle(
+                        stix_bundle=bundle,
+                        update=True,
+                        types=types,
+                        retry_number=processing_count,
+                    )
+
                 elif event_type == "delete":
                     delete_id = event_content["data"]["id"]
-                    self.api.stix.delete(id=delete_id)
+                    self._api.stix.delete(id=delete_id)
+
                 elif event_type == "merge":
                     # Start with a merge
                     target_id = event_content["data"]["id"]
-                    source_ids = list(
-                        map(
-                            lambda source: source["id"],
-                            event_content["context"]["sources"],
-                        )
+                    source_ids = [
+                        source["id"] for source in event_content["context"]["sources"]
+                    ]
+                    self._api.stix_core_object.merge(
+                        id=target_id,
+                        object_ids=source_ids,
                     )
-                    self.api.stix_core_object.merge(id=target_id, object_ids=source_ids)
+
                     # Update the target entity after merge
                     bundle = {
                         "type": "bundle",
                         "objects": [event_content["data"]],
                     }
-                    self.api.stix2.import_bundle(bundle, True, types, processing_count)
+                    self._api.stix2.import_bundle(
+                        stix_bundle=bundle,
+                        update=True,
+                        types=types,
+                        retry_number=processing_count,
+                    )
+
                 # Ack the message
-                cb = functools.partial(self.ack_message, channel, delivery_tag)
+                cb = functools.partial(self._ack_message, channel, delivery_tag)
                 connection.add_callback_threadsafe(cb)
-                self.processing_count = 0
+                self._processing_count = 0
                 bundles_success_counter.add(1)
-                return True
+
             else:
-                # Unknown type, just move on.
-                return True
-        except Timeout as te:
-            bundles_timeout_error_counter.add(1)
-            logging.warning("%s", f"A connection timeout occurred: {{ {te} }}")
+                log.warning("Unknown event type: { %s }", event_type)
+
+        except Timeout as ex:
             # Platform is under heavy load: wait for unlock & retry almost indefinitely.
+            log.warning("A connection timeout occurred: { %s }", ex)
+            bundles_timeout_error_counter.add(1)
             sleep_jitter = round(random.uniform(10, 30), 2)
             time.sleep(sleep_jitter)
-            self.data_handler(connection, channel, delivery_tag, data)
-            return True
-        except RequestException as re:
+            self._data_handler(connection, channel, delivery_tag, data)
+
+        except RequestException as ex:
             bundles_request_error_counter.add(1, {"origin": "opencti-worker"})
-            logging.error("%s", f"A connection error occurred: {{ {re} }}")
+            log.error("A connection error occurred: { %s }", ex)
             time.sleep(60)
-            logging.info(
-                "%s",
-                f"Message (delivery_tag={delivery_tag}) NOT acknowledged (RequestException)",
-            )
-            cb = functools.partial(self.nack_message, channel, delivery_tag)
+            log.info("Message (delivery_tag=%d) NOT acknowledged", delivery_tag)
+            cb = functools.partial(self._nack_message, channel, delivery_tag)
             connection.add_callback_threadsafe(cb)
-            self.processing_count = 0
-            return False
+            self._processing_count = 0
+
         except Exception as ex:  # pylint: disable=broad-except
             error = str(ex)
-            if "LockError" in error and self.processing_count < MAX_PROCESSING_COUNT:
+            if "LockError" in error and has_retries:
                 bundles_lock_error_counter.add(1)
                 # Platform is under heavy load:
                 # wait for unlock & retry almost indefinitely.
                 sleep_jitter = round(random.uniform(10, 30), 2)
                 time.sleep(sleep_jitter)
-                self.data_handler(connection, channel, delivery_tag, data)
-            elif (
-                "MissingReferenceError" in error
-                and self.processing_count < PROCESSING_COUNT
-            ):
+                self._data_handler(connection, channel, delivery_tag, data)
+
+            elif "MissingReferenceError" in error and has_retries:
                 bundles_missing_reference_error_counter.add(1)
                 # In case of missing reference, wait & retry
                 sleep_jitter = round(random.uniform(1, 3), 2)
                 time.sleep(sleep_jitter)
-                logging.info(
-                    "%s",
-                    (
-                        f"Message (delivery_tag={delivery_tag}) "
-                        f"reprocess (retry nb: {self.processing_count})"
-                    ),
+                log.info(
+                    "Message (delivery_tag=%d) reprocess (retry nb: %d)",
+                    delivery_tag,
+                    self._processing_count,
                 )
-                self.data_handler(connection, channel, delivery_tag, data)
+                self._data_handler(connection, channel, delivery_tag, data)
+
             elif "Bad Gateway" in error:
                 bundles_bad_gateway_error_counter.add(1)
-                logging.error("%s", f"A connection error occurred: {{ {error} }}")
+                log.error("A connection error occurred: { %s }", error)
                 time.sleep(60)
-                logging.info(
-                    "%s",
-                    f"Message (delivery_tag={delivery_tag}) NOT acknowledged (Bad Gateway)",
-                )
-                cb = functools.partial(self.nack_message, channel, delivery_tag)
+
+                log.info("Message (delivery_tag=%d) NOT acknowledged", delivery_tag)
+                cb = functools.partial(self._nack_message, channel, delivery_tag)
                 connection.add_callback_threadsafe(cb)
-                self.processing_count = 0
-                return False
+
+                self._processing_count = 0
+
             else:
-                bundles_technical_error_counter.add(1)
-                # Platform does not know what to do and raises an error:
+                # Platform does not know what to do and raises an error
                 # fail and acknowledge the message.
-                logging.error(error)
-                self.processing_count = 0
-                cb = functools.partial(self.ack_message, channel, delivery_tag)
+                bundles_technical_error_counter.add(1)
+                log.exception("Unexpected error")
+                self._processing_count = 0
+
+                cb = functools.partial(self._ack_message, channel, delivery_tag)
                 connection.add_callback_threadsafe(cb)
+
                 if work_id is not None:
-                    self.api.work.report_expectation(
-                        work_id,
-                        {
-                            "error": error,
-                            "source": content
-                            if len(content) < 50000
-                            else "Bundle too large",
-                        },
+                    if len(content) < 50000:
+                        source = "Bundle too large"
+                    else:
+                        source = content
+
+                    self._api.work.report_expectation(
+                        work_id, {"error": error, "source": source}
                     )
-                return False
-            return None
+
         finally:
             bundles_global_counter.add(1)
             processing_delta = datetime.datetime.now() - start_processing
             bundles_processing_time_gauge.record(processing_delta.seconds)
 
     def run(self) -> None:
+        """Run the thread"""
+
         try:
             # Consume the queue
-            logging.info("%s", f"Thread for queue {self.queue_name} started")
-            self.channel.basic_consume(
-                queue=self.queue_name,
+            log.info("Thread for queue %s started", self._queue_name)
+            self._channel.basic_consume(
+                queue=self._queue_name,
                 on_message_callback=self._process_message,
             )
-            self.channel.start_consuming()
+            self._channel.start_consuming()
         finally:
-            self.channel.stop_consuming()
-            logging.info("%s", f"Thread for queue {self.queue_name} terminated")
+            self._channel.stop_consuming()
+            log.info("Thread for queue %s terminated", self._queue_name)
 
 
-@dataclass(unsafe_hash=True)
-class Worker:  # pylint: disable=too-few-public-methods, too-many-instance-attributes
-    logs_all_queue: str = "logs_all"
-    consumer_threads: Dict[str, Any] = field(default_factory=dict, hash=False)
-    logger_threads: Dict[str, Any] = field(default_factory=dict, hash=False)
+class Worker:  # pylint: disable=too-few-public-methods
+    """Consumer controller"""
 
-    def __post_init__(self) -> None:
+    def __init__(self) -> None:
         # Get configuration
         config_file_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "config.yml"
         )
         if os.path.isfile(config_file_path):
-            with open(config_file_path, "r") as f:
+            with open(config_file_path, "r", encoding="utf-8") as f:
                 config = yaml.load(f, Loader=yaml.FullLoader)
         else:
             config = {}
 
         # Load API config
-        self.opencti_url = get_config_variable(
+        self._opencti_url = get_config_variable(
             "OPENCTI_URL", ["opencti", "url"], config
         )
-        self.opencti_token = get_config_variable(
+        self._opencti_token = get_config_variable(
             "OPENCTI_TOKEN", ["opencti", "token"], config
         )
-        self.opencti_ssl_verify = get_config_variable(
+        self._opencti_ssl_verify = get_config_variable(
             "OPENCTI_SSL_VERIFY", ["opencti", "ssl_verify"], config, False, False
         )
-        self.opencti_json_logging = get_config_variable(
+        self._opencti_json_logging = get_config_variable(
             "OPENCTI_JSON_LOGGING", ["opencti", "json_logging"], config
         )
         # Load worker config
-        self.log_level = get_config_variable(
+        self._log_level = get_config_variable(
             "WORKER_LOG_LEVEL", ["worker", "log_level"], config
         )
+
         # Telemetry
-        self.telemetry_enabled = get_config_variable(
+        telemetry_enabled = get_config_variable(
             "WORKER_TELEMETRY_ENABLED",
             ["worker", "telemetry_enabled"],
             config,
             False,
             False,
         )
-        self.telemetry_prometheus_port = get_config_variable(
+        telemetry_prometheus_port = get_config_variable(
             "WORKER_PROMETHEUS_TELEMETRY_PORT",
             ["worker", "telemetry_prometheus_port"],
             config,
             False,
             14270,
         )
-        self.telemetry_prometheus_host = get_config_variable(
+        telemetry_prometheus_host = get_config_variable(
             "WORKER_PROMETHEUS_TELEMETRY_HOST",
             ["worker", "telemetry_prometheus_host"],
             config,
@@ -417,105 +456,99 @@ class Worker:  # pylint: disable=too-few-public-methods, too-many-instance-attri
         )
 
         # Telemetry
-        if self.telemetry_enabled:
+        if telemetry_enabled:
             start_http_server(
-                port=self.telemetry_prometheus_port, addr=self.telemetry_prometheus_host
+                port=telemetry_prometheus_port,
+                addr=telemetry_prometheus_host,
             )
             provider = MeterProvider(
-                resource=resource, metric_readers=[PrometheusMetricReader()]
+                resource=resource,
+                metric_readers=[PrometheusMetricReader()],
             )
             metrics.set_meter_provider(provider)
 
         # Check if openCTI is available
-        self.api = OpenCTIApiClient(
-            url=self.opencti_url,
-            token=self.opencti_token,
-            log_level=self.log_level,
-            ssl_verify=self.opencti_ssl_verify,
-            json_logging=self.opencti_json_logging,
+        self._api = OpenCTIApiClient(
+            url=self._opencti_url,
+            token=self._opencti_token,
+            log_level=self._log_level,
+            ssl_verify=self._opencti_ssl_verify,
+            json_logging=self._opencti_json_logging,
         )
 
         # Configure logger
-        numeric_level = getattr(logging, self.log_level.upper(), None)
+        numeric_level = getattr(logging, self._log_level.upper(), None)
         if not isinstance(numeric_level, int):
-            raise ValueError(f"Invalid log level: {self.log_level}")
+            raise ValueError(f"Invalid log level: {self._log_level}")
         logging.basicConfig(level=numeric_level)
 
-        # Initialize variables
-        self.connectors: List[Any] = []
-        self.queues: List[Any] = []
-
-    # Start the main loop
     def start(self) -> None:
+        """Start the main loop"""
+
         sleep_delay = 60
+        consumer_threads = {}
+        queues = []
+
         while True:
             try:
                 # Fetch queue configuration from API
-                self.connectors = self.api.connector.list()
-                self.queues = list(
-                    map(lambda x: x["config"]["push"], self.connectors)  # type: ignore
-                )
+                connectors = self._api.connector.list()
+                queues = [conn["config"]["push"] for conn in connectors]
 
                 # Check if all queues are consumed
-                for connector in self.connectors:
+                for connector in connectors:
                     queue = connector["config"]["push"]
-                    if queue in self.consumer_threads:
-                        if not self.consumer_threads[queue].is_alive():
-                            logging.info(
-                                "%s",
-                                (
-                                    f"Thread for queue {queue} not alive"
-                                    ", creating a new one..."
-                                ),
+                    if queue in consumer_threads:
+                        if not consumer_threads[queue].is_alive():
+                            log.info(
+                                "Thread for queue %s not alive, creating a new one...",
+                                queue,
                             )
-                            self.consumer_threads[queue] = Consumer(
+                            consumer_threads[queue] = Consumer(
                                 connector,
-                                self.opencti_url,
-                                self.opencti_token,
-                                self.log_level,
-                                self.opencti_ssl_verify,
-                                self.opencti_json_logging,
+                                self._opencti_url,
+                                self._opencti_token,
+                                self._log_level,
+                                self._opencti_ssl_verify,
+                                self._opencti_json_logging,
                             )
-                            self.consumer_threads[queue].start()
+                            consumer_threads[queue].start()
                     else:
-                        self.consumer_threads[queue] = Consumer(
+                        consumer_threads[queue] = Consumer(
                             connector,
-                            self.opencti_url,
-                            self.opencti_token,
-                            self.log_level,
-                            self.opencti_ssl_verify,
-                            self.opencti_json_logging,
+                            self._opencti_url,
+                            self._opencti_token,
+                            self._log_level,
+                            self._opencti_ssl_verify,
+                            self._opencti_json_logging,
                         )
-                        self.consumer_threads[queue].start()
+                        consumer_threads[queue].start()
 
                 # Check if some threads must be stopped
-                for thread in list(self.consumer_threads):
-                    if thread not in self.queues:
-                        logging.info(
-                            "%s",
-                            f"Queue {thread} no longer exists, killing thread...",
-                        )
+                for qid in list(consumer_threads):
+                    if qid not in queues:
+                        log.info("Queue %s no longer exists, killing thread...", qid)
                         try:
-                            self.consumer_threads[thread].terminate()
-                            self.consumer_threads.pop(thread, None)
-                        except:  # TODO: remove bare except
-                            logging.info(
-                                "%s",
-                                (
-                                    f"Unable to kill the thread for queue {thread}"
-                                    ", an operation is running, keep trying..."
-                                ),
+                            consumer_threads[qid].terminate()
+                            consumer_threads.pop(qid, None)
+                        except Exception:  # pylint: disable=broad-except
+                            log.info(
+                                "Unable to kill the thread for queue %s, "
+                                "an operation is running, keep trying...",
+                                qid,
                             )
                 time.sleep(sleep_delay)
+
             except KeyboardInterrupt:
                 # Graceful stop
-                for thread in self.consumer_threads:
-                    if thread not in self.queues:
-                        self.consumer_threads[thread].terminate()
+                for qid, thread in consumer_threads.items():
+                    if qid not in queues:
+                        thread.terminate()
                 sys.exit(0)
-            except Exception as e:  # pylint: disable=broad-except
-                logging.error(e)
-                time.sleep(60)
+
+            except Exception:  # pylint: disable=broad-except
+                log.exception("Unexpected error")
+                time.sleep(sleep_delay)
 
 
 if __name__ == "__main__":
@@ -523,6 +556,6 @@ if __name__ == "__main__":
 
     try:
         worker.start()
-    except Exception as e:  # pylint: disable=broad-except
-        logging.error(e)
+    except Exception:  # pylint: disable=broad-except
+        log.exception("Unhandled exception")
         sys.exit(1)
