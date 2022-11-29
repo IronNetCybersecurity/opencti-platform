@@ -1,18 +1,21 @@
 """OpenCTI Worker"""
 
+from __future__ import annotations
+
 import base64
-import ctypes
 import datetime
 import functools
 import json
 import logging
 import os
 import random
+import signal
 import sys
 import threading
 import time
 from threading import Thread
-from typing import Any, Dict, Union
+from types import FrameType
+from typing import Any, Dict, List, Union
 
 import pika
 import yaml
@@ -31,7 +34,7 @@ from pycti.connector.opencti_connector_helper import (
 )
 from requests.exceptions import RequestException, Timeout
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("worker")
 
 PROCESSING_COUNT = 4
 
@@ -115,103 +118,68 @@ class Consumer(Thread):
             ),
         )
 
-        self._pika_connection = BlockingConnection(pika_parameters)
-        self._channel = self._pika_connection.channel()
+        self._connection = BlockingConnection(pika_parameters)
+        self._channel = self._connection.channel()
         self._channel.basic_qos(prefetch_count=1)
         self._processing_count = 0
 
-    @property
-    def id(self) -> Any:
-        """Get the threat ID"""
+    def run(self) -> None:
+        """Run the thread"""
 
-        if hasattr(self, "_thread_id"):
-            return getattr(self, "_thread_id")
+        consumer_tag = None
 
-        # pylint: disable=protected-access
-        # noinspection PyProtectedMember,PyUnresolvedReferences
-        for tid, thread in threading._active.items():
-            if thread is self:
-                return tid
+        try:
+            # Consume the queue
+            log.info("Thread for queue %s started", self._queue_name)
 
-        return None
-
-    def terminate(self) -> None:
-        """Terminate the thread."""
-
-        thread_id = self.id
-        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-            thread_id, ctypes.py_object(SystemExit)
-        )
-        if res > 1:
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
-            log.info("Unable to kill the thread")
-
-    def _nack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
-        """NACK a message"""
-
-        if channel.is_open:
-            log.info(
-                "Message (delivery_tag=%d) rejected",
-                delivery_tag,
+            consumer_tag = self._channel.basic_consume(
+                queue=self._queue_name,
+                on_message_callback=self._process_message,
             )
-            channel.basic_nack(delivery_tag)
-        else:
-            log.info(
-                "Message (delivery_tag=%d) NOT rejected (channel closed)",
-                delivery_tag,
-            )
+            self._channel.start_consuming()
+        finally:
+            if consumer_tag is not None:
+                self._channel.basic_cancel(consumer_tag)
+            if self._channel.is_open:
+                self._channel.close()
+            if self._connection.is_open:
+                self._connection.close()
+            log.info("Thread for queue %s terminated", self._queue_name)
 
-    def _ack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
-        """ACK a message"""
+    def stop(self) -> None:
+        """Gracefully shutdown the consumer"""
 
-        if channel.is_open:
-            log.info(
-                "Message (delivery_tag=%d) acknowledged",
-                delivery_tag,
-            )
-            channel.basic_ack(delivery_tag)
-        else:
-            log.info(
-                "Message (delivery_tag=%d) NOT acknowledged (channel closed)",
-                delivery_tag,
-            )
+        def callback():
+            """A threadsafe callback to stop consuming"""
+            self._channel.stop_consuming()
 
-    def stop_consume(self, channel: BlockingChannel) -> None:
-        """Stop consuming if the underlying channel is open"""
-
-        if channel.is_open:
-            channel.stop_consuming()
+        self._connection.add_callback_threadsafe(callback)
 
     def _process_message(
         self,
         channel: BlockingChannel,
         method: Basic.Deliver,
-        _properties: BasicProperties,  # Unused but required
+        _properties: BasicProperties,
         body: bytes,
     ) -> None:
         """Callable for consuming a message"""
 
         data = json.loads(body)
         log.info(
-            "Processing a new message (delivery_tag=%d), launching a thread...",
+            "Processing a new message (delivery_tag=%d)",
             method.delivery_tag,
         )
-        thread = Thread(
-            target=self._data_handler,
-            args=[self._pika_connection, channel, method.delivery_tag, data],
-        )
-        thread.start()
 
-        # Loop while the thread is processing
-        while thread.is_alive():
-            self._pika_connection.sleep(0.05)
+        self._data_handler(channel, method.delivery_tag, data)
 
-        log.info("Message processed, thread terminated")
+        log.debug("Message processed")
 
-    # pylint: disable=too-many-arguments,too-many-locals,too-many-statements,too-many-branches
+    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-locals
+    # pylint: disable=too-many-statements
+    # pylint: disable=too-many-branches
     def _data_handler(
         self,
-        connection: BlockingConnection,
         channel: BlockingChannel,
         delivery_tag: int,
         data: Dict[str, Any],
@@ -247,7 +215,7 @@ class Consumer(Thread):
 
                 # Ack the message
                 cb = functools.partial(self._ack_message, channel, delivery_tag)
-                connection.add_callback_threadsafe(cb)
+                channel.connection.add_callback_threadsafe(cb)
 
                 work_id = data.get("work_id")
                 if work_id is not None:
@@ -302,7 +270,7 @@ class Consumer(Thread):
 
                 # Ack the message
                 cb = functools.partial(self._ack_message, channel, delivery_tag)
-                connection.add_callback_threadsafe(cb)
+                channel.connection.add_callback_threadsafe(cb)
                 self._processing_count = 0
                 bundles_success_counter.add(1)
 
@@ -315,15 +283,14 @@ class Consumer(Thread):
             bundles_timeout_error_counter.add(1)
             sleep_jitter = round(random.uniform(10, 30), 2)
             time.sleep(sleep_jitter)
-            self._data_handler(connection, channel, delivery_tag, data)
+            self._data_handler(channel, delivery_tag, data)
 
         except RequestException as ex:
             bundles_request_error_counter.add(1, {"origin": "opencti-worker"})
             log.error("A connection error occurred: { %s }", ex)
             time.sleep(60)
-            log.info("Message (delivery_tag=%d) NOT acknowledged", delivery_tag)
             cb = functools.partial(self._nack_message, channel, delivery_tag)
-            connection.add_callback_threadsafe(cb)
+            channel.connection.add_callback_threadsafe(cb)
             self._processing_count = 0
 
         except Exception as ex:  # pylint: disable=broad-except
@@ -334,7 +301,7 @@ class Consumer(Thread):
                 # wait for unlock & retry almost indefinitely.
                 sleep_jitter = round(random.uniform(10, 30), 2)
                 time.sleep(sleep_jitter)
-                self._data_handler(connection, channel, delivery_tag, data)
+                self._data_handler(channel, delivery_tag, data)
 
             elif "MissingReferenceError" in error and has_retries:
                 bundles_missing_reference_error_counter.add(1)
@@ -346,16 +313,15 @@ class Consumer(Thread):
                     delivery_tag,
                     self._processing_count,
                 )
-                self._data_handler(connection, channel, delivery_tag, data)
+                self._data_handler(channel, delivery_tag, data)
 
             elif "Bad Gateway" in error:
                 bundles_bad_gateway_error_counter.add(1)
                 log.error("A connection error occurred: { %s }", error)
                 time.sleep(60)
 
-                log.info("Message (delivery_tag=%d) NOT acknowledged", delivery_tag)
                 cb = functools.partial(self._nack_message, channel, delivery_tag)
-                connection.add_callback_threadsafe(cb)
+                channel.connection.add_callback_threadsafe(cb)
 
                 self._processing_count = 0
 
@@ -363,18 +329,19 @@ class Consumer(Thread):
                 # Platform does not know what to do and raises an error
                 # fail and acknowledge the message.
                 bundles_technical_error_counter.add(1)
-                log.exception("Unexpected error")
+
+                # if len(content) > 50000:
+                #    source = "Bundle too large"
+                # else:
+                source = content
+
+                log.exception(f"Unexpected error from: {source}")
                 self._processing_count = 0
 
                 cb = functools.partial(self._ack_message, channel, delivery_tag)
-                connection.add_callback_threadsafe(cb)
+                channel.connection.add_callback_threadsafe(cb)
 
                 if work_id is not None:
-                    if len(content) < 50000:
-                        source = "Bundle too large"
-                    else:
-                        source = content
-
                     self._api.work.report_expectation(
                         work_id, {"error": error, "source": source}
                     )
@@ -384,20 +351,35 @@ class Consumer(Thread):
             processing_delta = datetime.datetime.now() - start_processing
             bundles_processing_time_gauge.record(processing_delta.seconds)
 
-    def run(self) -> None:
-        """Run the thread"""
+    def _ack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+        """ACK a message"""
 
-        try:
-            # Consume the queue
-            log.info("Thread for queue %s started", self._queue_name)
-            self._channel.basic_consume(
-                queue=self._queue_name,
-                on_message_callback=self._process_message,
+        if channel.is_open:
+            log.debug(
+                "Message (delivery_tag=%d) acknowledged",
+                delivery_tag,
             )
-            self._channel.start_consuming()
-        finally:
-            self._channel.stop_consuming()
-            log.info("Thread for queue %s terminated", self._queue_name)
+            channel.basic_ack(delivery_tag)
+        else:
+            log.warning(
+                "Message (delivery_tag=%d) NOT acknowledged (channel closed)",
+                delivery_tag,
+            )
+
+    def _nack_message(self, channel: BlockingChannel, delivery_tag: int) -> None:
+        """NACK a message"""
+
+        if channel.is_open:
+            log.debug(
+                "Message (delivery_tag=%d) rejected",
+                delivery_tag,
+            )
+            channel.basic_nack(delivery_tag)
+        else:
+            log.warning(
+                "Message (delivery_tag=%d) NOT rejected (channel closed)",
+                delivery_tag,
+            )
 
 
 class Worker:  # pylint: disable=too-few-public-methods
@@ -482,29 +464,31 @@ class Worker:  # pylint: disable=too-few-public-methods
             raise ValueError(f"Invalid log level: {self._log_level}")
         logging.basicConfig(level=numeric_level)
 
+        self._consumers = {}  # type: Dict[str, Consumer]
+        self._shutdown = threading.Event()
+
+        signal.signal(signal.SIGINT, self._handle_signal)  # ctrl-c
+        signal.signal(signal.SIGTERM, self._handle_signal)  # docker stop
+
     def start(self) -> None:
         """Start the main loop"""
 
-        sleep_delay = 60
-        consumer_threads = {}
-        queues = []
-
-        while True:
+        while not self._shutdown.is_set():
             try:
                 # Fetch queue configuration from API
                 connectors = self._api.connector.list()
-                queues = [conn["config"]["push"] for conn in connectors]
+                conn_ids: List[str] = [conn["config"]["push"] for conn in connectors]
 
                 # Check if all queues are consumed
                 for connector in connectors:
-                    queue = connector["config"]["push"]
-                    if queue in consumer_threads:
-                        if not consumer_threads[queue].is_alive():
+                    conn_id = connector["config"]["push"]
+                    if conn_id in self._consumers:
+                        if not self._consumers[conn_id].is_alive():
                             log.info(
                                 "Thread for queue %s not alive, creating a new one...",
-                                queue,
+                                conn_id,
                             )
-                            consumer_threads[queue] = Consumer(
+                            self._consumers[conn_id] = Consumer(
                                 connector,
                                 self._opencti_url,
                                 self._opencti_token,
@@ -512,9 +496,9 @@ class Worker:  # pylint: disable=too-few-public-methods
                                 self._opencti_ssl_verify,
                                 self._opencti_json_logging,
                             )
-                            consumer_threads[queue].start()
+                            self._consumers[conn_id].start()
                     else:
-                        consumer_threads[queue] = Consumer(
+                        self._consumers[conn_id] = Consumer(
                             connector,
                             self._opencti_url,
                             self._opencti_token,
@@ -522,33 +506,36 @@ class Worker:  # pylint: disable=too-few-public-methods
                             self._opencti_ssl_verify,
                             self._opencti_json_logging,
                         )
-                        consumer_threads[queue].start()
+                        self._consumers[conn_id].start()
 
                 # Check if some threads must be stopped
-                for qid in list(consumer_threads):
-                    if qid not in queues:
-                        log.info("Queue %s no longer exists, killing thread...", qid)
-                        try:
-                            consumer_threads[qid].terminate()
-                            consumer_threads.pop(qid, None)
-                        except Exception:  # pylint: disable=broad-except
-                            log.info(
-                                "Unable to kill the thread for queue %s, "
-                                "an operation is running, keep trying...",
-                                qid,
-                            )
-                time.sleep(sleep_delay)
-
-            except KeyboardInterrupt:
-                # Graceful stop
-                for qid, thread in consumer_threads.items():
-                    if qid not in queues:
-                        thread.terminate()
-                sys.exit(0)
+                for conn_id in list(self._consumers):
+                    if conn_id not in conn_ids:
+                        log.info("Queue %s no longer exists, stopping thread", conn_id)
+                        thread = self._consumers.pop(conn_id)
+                        thread.stop()
+                        log.info("Waiting on thread for queue %s to finish", conn_id)
+                        thread.join()
+                        log.info("Thread for queue %s has terminated", conn_id)
 
             except Exception:  # pylint: disable=broad-except
                 log.exception("Unexpected error")
-                time.sleep(sleep_delay)
+
+            self._shutdown.wait(timeout=60)
+
+    def _handle_signal(self, signum: int, _frame: FrameType) -> None:
+        sig_name = signal.Signals(signum).name
+
+        log.info("Stopping main loop")
+        self._shutdown.set()
+
+        log.info(f"Stopping all consumer threads ({sig_name})")
+        for conn_id, thread in self._consumers.items():
+            log.info("Stopping thread for queue %s", conn_id)
+            thread.stop()
+            log.info("Waiting on thread for queue %s to finish", conn_id)
+            thread.join()
+            log.info("Thread for queue %s has terminated", conn_id)
 
 
 if __name__ == "__main__":

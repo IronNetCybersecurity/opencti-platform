@@ -16,5 +16,6 @@ RUN apk --no-cache add git build-base libmagic libffi-dev \
 
 COPY src .
 
+ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3"]
 CMD ["worker.py"]
